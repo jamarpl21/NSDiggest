@@ -133,7 +133,7 @@ Pipeline behavior:
    - creates release-local `.venv`
    - installs/refreshes systemd units
    - switches `/opt/nsdiggest/current` atomically
-   - runs smoke check (`--dry-run --skip-send --skip-mark-seen --max-newsletters 1`)
+   - runs fast startup check (`python -m src.main --help`) without processing inbox
    - keeps only the latest releases (`KEEP_RELEASES`, default `5`)
 
 ### 4. Rollback
@@ -158,6 +158,12 @@ systemctl status nsdiggest.service
 journalctl -u nsdiggest.service -e
 tail -f /var/log/nsdiggest/run.log
 readlink -f /opt/nsdiggest/current
+```
+
+Optional manual dry-run after deploy (can be slow on large inboxes):
+
+```bash
+sudo -u nsdiggest /opt/nsdiggest/current/.venv/bin/python -m src.main --dry-run --skip-send --skip-mark-seen --max-newsletters 1
 ```
 
 ## Configuration

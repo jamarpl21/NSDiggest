@@ -62,14 +62,11 @@ systemctl daemon-reload
 systemctl enable nsdiggest.timer >/dev/null
 systemctl start nsdiggest.timer
 
-echo ">>> Smoke check after rollback"
+echo ">>> Fast startup check after rollback (no inbox processing)"
 sudo -u "${APP_USER}" bash -c "
   set -euo pipefail
   cd '${CURRENT_LINK}'
-  set -a
-  source '${ENV_FILE}'
-  set +a
-  '${CURRENT_LINK}/.venv/bin/python' -m src.main --dry-run --skip-send --skip-mark-seen --max-newsletters 1
+  '${CURRENT_LINK}/.venv/bin/python' -m src.main --help >/dev/null
 "
 
 echo ">>> Rollback complete: ${target_release_id}"

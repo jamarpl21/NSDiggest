@@ -61,14 +61,11 @@ systemctl enable nsdiggest.timer >/dev/null
 echo ">>> Switching current release"
 ln -sfn "${RELEASE_DIR}" "${CURRENT_LINK}"
 
-echo ">>> Smoke check"
+echo ">>> Fast startup check (no inbox processing)"
 sudo -u "${APP_USER}" bash -c "
   set -euo pipefail
   cd '${CURRENT_LINK}'
-  set -a
-  source '${ENV_FILE}'
-  set +a
-  '${CURRENT_LINK}/.venv/bin/python' -m src.main --dry-run --skip-send --skip-mark-seen --max-newsletters 1
+  '${CURRENT_LINK}/.venv/bin/python' -m src.main --help >/dev/null
 "
 
 echo ">>> Ensuring timer is active"

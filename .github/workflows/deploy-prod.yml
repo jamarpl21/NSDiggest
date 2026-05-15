@@ -122,8 +122,4 @@ jobs:
         run: |
           remote_artifact="/tmp/${{ needs.build.outputs.artifact_name }}"
           ssh -p "${PROD_SSH_PORT}" "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
-            "set -euo pipefail; \
-             tmp_dir=\$(mktemp -d); \
-             trap 'rm -rf \"\${tmp_dir}\" \"${remote_artifact}\"' EXIT; \
-             tar -xzf '${remote_artifact}' -C \"\${tmp_dir}\"; \
-             sudo bash \"\${tmp_dir}/deploy/release_deploy.sh\" '${{ needs.build.outputs.release_id }}' '${remote_artifact}'"
+            "sudo -n /usr/bin/bash /opt/nsdiggest/current/deploy/release_deploy.sh '${{ needs.build.outputs.release_id }}' '${remote_artifact}'"
