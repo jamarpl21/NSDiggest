@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime
 
-from .config import load_config
+from .config import ProcessingMode, load_config
 from .digest import digest_to_json, generate_digest, make_anthropic_client
 from .fetch import FetchedEmail, fetch_newsletters, group_by_date, mark_seen
 from .render import render_email
@@ -70,6 +70,12 @@ def run() -> int:
     )
     parser.add_argument("--skip-send", action="store_true", help="Generate digest but do not send email")
     parser.add_argument("--skip-mark-seen", action="store_true", help="Never mark emails as SEEN")
+    parser.add_argument(
+        "--processing-mode",
+        choices=("no-llm", "llm-only", "hybrid"),
+        default="",
+        help="Processing strategy override: no-llm, llm-only, hybrid",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -82,6 +88,9 @@ def run() -> int:
     dry_run = cfg.dry_run or args.dry_run
     skip_send = dry_run or args.skip_send
     skip_mark_seen = dry_run or args.skip_mark_seen
+    processing_mode: ProcessingMode = (
+        args.processing_mode if args.processing_mode else cfg.processing_mode
+    )
     only_indices: set[int] | None = None
     if args.only_indices.strip():
         try:
@@ -94,14 +103,20 @@ def run() -> int:
         return 2
 
     log.info(
-        "Starting NSDiggest run_id=%s dry_run=%s skip_send=%s skip_mark_seen=%s only_indices=%s max_newsletters=%d stage1_model=%s stage2_model=%s stage1_workers=%d",
+        "Starting NSDiggest run_id=%s dry_run=%s skip_send=%s skip_mark_seen=%s only_indices=%s max_newsletters=%d processing_mode=%s stage1_model=%s stage2_model=%s stage1_workers=%d",
         run_id, dry_run, skip_send, skip_mark_seen, sorted(only_indices) if only_indices is not None else None, args.max_newsletters,
-        cfg.anthropic_model_stage1, cfg.anthropic_model_stage2, cfg.stage1_max_workers,
+        processing_mode, cfg.anthropic_model_stage1, cfg.anthropic_model_stage2, cfg.stage1_max_workers,
     )
 
     t_run_start = time.monotonic()
 
-    anthropic_client = make_anthropic_client(cfg)
+    anthropic_client = None
+    if processing_mode != "no-llm":
+        try:
+            anthropic_client = make_anthropic_client(cfg)
+        except Exception:
+            log.exception("Failed to initialize Anthropic client for processing_mode=%s", processing_mode)
+            return 2
 
     try:
         emails = fetch_newsletters(cfg)
@@ -141,7 +156,13 @@ def run() -> int:
 
         t_day_start = time.monotonic()
         try:
-            digest = generate_digest(cfg, date, day_emails, client=anthropic_client)
+            digest = generate_digest(
+                cfg,
+                date,
+                day_emails,
+                client=anthropic_client,
+                processing_mode=processing_mode,
+            )
         except Exception:
             log.exception("Digest generation failed for %s", date)
             failures += 1

@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
+
+ProcessingMode = Literal["no-llm", "llm-only", "hybrid"]
 
 
 @dataclass(frozen=True)
@@ -19,7 +22,8 @@ class Config:
     digest_to: str
     digest_from_name: str
 
-    anthropic_api_key: str
+    anthropic_api_key: str | None
+    processing_mode: ProcessingMode
 
     # Stage 1: per-newsletter topic extraction
     anthropic_model_stage1: str
@@ -62,6 +66,16 @@ def load_config() -> Config:
 
     # Support legacy ANTHROPIC_MODEL as fallback for both stages
     legacy_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    processing_mode_raw = os.environ.get("PROCESSING_MODE", "llm-only").strip().lower()
+    allowed_modes = {"no-llm", "llm-only", "hybrid"}
+    if processing_mode_raw not in allowed_modes:
+        raise RuntimeError(
+            "Invalid PROCESSING_MODE. Expected one of: no-llm, llm-only, hybrid"
+        )
+    processing_mode: ProcessingMode = processing_mode_raw  # type: ignore[assignment]
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip() or None
+    if processing_mode != "no-llm" and not anthropic_api_key:
+        raise RuntimeError("Missing required env var: ANTHROPIC_API_KEY")
 
     return Config(
         gmail_user=_require("GMAIL_USER"),
@@ -72,7 +86,8 @@ def load_config() -> Config:
         smtp_port=int(os.environ.get("SMTP_PORT", "587")),
         digest_to=_require("DIGEST_TO"),
         digest_from_name=os.environ.get("DIGEST_FROM_NAME", "Newsletter Digest"),
-        anthropic_api_key=_require("ANTHROPIC_API_KEY"),
+        anthropic_api_key=anthropic_api_key,
+        processing_mode=processing_mode,
         anthropic_model_stage1=os.environ.get("ANTHROPIC_MODEL_STAGE1", legacy_model),
         anthropic_model_stage2=os.environ.get("ANTHROPIC_MODEL_STAGE2", legacy_model),
         stage1_max_workers=int(os.environ.get("STAGE1_MAX_WORKERS", "5")),

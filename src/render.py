@@ -79,6 +79,7 @@ def _render_newsletter(newsletter: DigestNewsletter, idx: int) -> str:
     initials = _initials(newsletter.sender)
     sender = html.escape(newsletter.sender)
     cost_txt = f"${newsletter.estimated_cost_usd:.4f}"
+    source_badge = "LLM" if newsletter.processed_with == "llm" else "reguły"
     topics_html = "\n".join(_render_topic(t) for t in newsletter.topics)
     return f"""
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;">
@@ -86,7 +87,7 @@ def _render_newsletter(newsletter: DigestNewsletter, idx: int) -> str:
       <div style="width:28px;height:28px;border-radius:50%;background:{bg};display:flex;align-items:center;justify-content:center;font-weight:600;font-size:11px;color:{fg};">{html.escape(initials)}</div>
       <span style="font-weight:600;font-size:15px;color:#1a1a1a;">{sender}</span>
       </div>
-      <span style="font-size:11px;color:#888;">koszt LLM ~ {cost_txt}</span>
+      <span style="font-size:11px;color:#888;">{source_badge} · koszt LLM ~ {cost_txt}</span>
     </div>
     {topics_html}
     """
@@ -98,6 +99,12 @@ def render_email(digest: Digest) -> tuple[str, str]:
     n_topics = digest.topic_count
     n_dupes = digest.duplicate_count
     total_cost = digest.estimated_cost_usd
+    llm_newsletters = sum(1 for n in digest.newsletters if n.processed_with == "llm")
+    mode_label = {
+        "no-llm": "bez LLM",
+        "llm-only": "tylko LLM",
+        "hybrid": "hybryda",
+    }.get(digest.processing_mode, digest.processing_mode)
 
     sections = []
     for i, nl in enumerate(digest.newsletters):
@@ -107,6 +114,12 @@ def render_email(digest: Digest) -> tuple[str, str]:
 
     body = "\n".join(sections)
 
+    stats_suffix = (
+        f"tryb: {mode_label} · {llm_newsletters}/{n_newsletters} przez LLM · koszt LLM ~ ${total_cost:.4f}"
+        if digest.processing_mode == "hybrid"
+        else f"tryb: {mode_label} · koszt LLM ~ ${total_cost:.4f}"
+    )
+
     html_body = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
 <body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
@@ -114,7 +127,7 @@ def render_email(digest: Digest) -> tuple[str, str]:
 
   <div style="padding:24px 20px 16px;border-bottom:1px solid #eee;">
     <h1 style="margin:0;font-size:20px;font-weight:600;color:#1a1a1a;">Newslettery {html.escape(date_pl)}</h1>
-    <p style="margin:4px 0 0;font-size:13px;color:#888;">{n_newsletters} newsletter{'ów' if n_newsletters != 1 else ''} · {n_topics} temat{'ów' if n_topics != 1 else ''} · {n_dupes} powtarzających się · koszt LLM ~ ${total_cost:.4f}</p>
+    <p style="margin:4px 0 0;font-size:13px;color:#888;">{n_newsletters} newsletter{'ów' if n_newsletters != 1 else ''} · {n_topics} temat{'ów' if n_topics != 1 else ''} · {n_dupes} powtarzających się · {stats_suffix}</p>
   </div>
 
   <div style="padding:20px;">

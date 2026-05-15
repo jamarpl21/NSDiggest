@@ -9,8 +9,14 @@ from pathlib import Path
 
 from anthropic import Anthropic
 
-from .config import Config
+from .config import Config, ProcessingMode
 from .fetch import FetchedEmail
+from .rule_digest import (
+    RuleTopic,
+    compute_rule_dedup_assignments,
+    extract_rule_topics,
+    rule_output_is_sufficient,
+)
 
 log = logging.getLogger(__name__)
 
@@ -247,12 +253,14 @@ class DigestNewsletter:
     estimated_cost_usd: float = 0.0
     stage1_input_tokens: int = 0
     stage1_output_tokens: int = 0
+    processed_with: str = "llm"
 
 
 @dataclass
 class Digest:
     date: str
     newsletters: list[DigestNewsletter]
+    processing_mode: ProcessingMode = "llm-only"
 
     @property
     def topic_count(self) -> int:
@@ -582,6 +590,66 @@ def _build_stage2_message(newsletters: list[DigestNewsletter]) -> str:
     )
 
 
+def _rule_newsletter_from_email(idx: int, email: FetchedEmail) -> DigestNewsletter:
+    rule_topics = extract_rule_topics(email.text_content, email.raw_links)
+    topics = [DigestTopic(title=t.title, summary=t.summary, links=t.links) for t in rule_topics]
+    return DigestNewsletter(
+        sender=email.sender_name or email.sender_email,
+        subject=email.subject,
+        topics=topics,
+        original_index=idx,
+        estimated_cost_usd=0.0,
+        stage1_input_tokens=0,
+        stage1_output_tokens=0,
+        processed_with="rules",
+    )
+
+
+def _apply_dedup_assignments(newsletters: list[DigestNewsletter], assignments: list[dict], source: str) -> list[DigestNewsletter]:
+    nl_by_idx: dict[int, DigestNewsletter] = {nl.original_index: nl for nl in newsletters}
+    applied = 0
+    for a in assignments:
+        if not isinstance(a, dict):
+            continue
+        try:
+            nl_idx = int(a["newsletter_idx"])
+            topic_idx = int(a["topic_idx"])
+            dup_of = int(a["duplicate_of_newsletter_idx"])
+        except (KeyError, TypeError, ValueError):
+            log.debug("%s: malformed assignment %r — skipped", source, a)
+            continue
+        nl = nl_by_idx.get(nl_idx)
+        if nl is None:
+            log.debug("%s: unknown newsletter_idx=%d — skipped", source, nl_idx)
+            continue
+        if topic_idx < 0 or topic_idx >= len(nl.topics):
+            log.debug("%s: topic_idx=%d out of range for newsletter_idx=%d — skipped", source, topic_idx, nl_idx)
+            continue
+        if dup_of == nl_idx:
+            log.debug("%s: self-reference assignment (newsletter_idx=%d) — skipped", source, nl_idx)
+            continue
+        nl.topics[topic_idx].duplicate_of = dup_of
+        applied += 1
+    log.info("%s: applied %d duplicate marking(s)", source, applied)
+    return newsletters
+
+
+def _run_rule_dedup(newsletters: list[DigestNewsletter], date: str) -> list[DigestNewsletter]:
+    if len(newsletters) <= 1:
+        log.info("Rule dedup: skipped (only %d newsletter)", len(newsletters))
+        return newsletters
+    payload = [
+        {
+            "newsletter_idx": nl.original_index,
+            "topics": [{"title": t.title, "summary": t.summary, "links": t.links} for t in nl.topics],
+        }
+        for nl in newsletters
+    ]
+    assignments = compute_rule_dedup_assignments(payload)
+    log.info("Rule dedup: date=%s received %d assignment(s)", date, len(assignments))
+    return _apply_dedup_assignments(newsletters, assignments, "Rule dedup")
+
+
 def _run_stage2_dedup(
     client: Anthropic,
     cfg: Config,
@@ -649,37 +717,13 @@ def _run_stage2_dedup(
     assignments = (tool_use.input or {}).get("assignments", []) or []
     log.info("Stage2: received %d duplicate assignment(s)", len(assignments))
 
-    nl_by_idx: dict[int, DigestNewsletter] = {nl.original_index: nl for nl in newsletters}
-    applied = 0
-    for a in assignments:
-        if not isinstance(a, dict):
-            continue
-        try:
-            nl_idx = int(a["newsletter_idx"])
-            topic_idx = int(a["topic_idx"])
-            dup_of = int(a["duplicate_of_newsletter_idx"])
-        except (KeyError, TypeError, ValueError):
-            log.debug("Stage2: malformed assignment %r — skipped", a)
-            continue
-        nl = nl_by_idx.get(nl_idx)
-        if nl is None:
-            log.debug("Stage2: unknown newsletter_idx=%d — skipped", nl_idx)
-            continue
-        if topic_idx < 0 or topic_idx >= len(nl.topics):
-            log.debug("Stage2: topic_idx=%d out of range for newsletter_idx=%d — skipped", topic_idx, nl_idx)
-            continue
-        if dup_of == nl_idx:
-            log.debug("Stage2: self-reference assignment (newsletter_idx=%d) — skipped", nl_idx)
-            continue
-        nl.topics[topic_idx].duplicate_of = dup_of
-        applied += 1
-
-    log.info("Stage2: applied %d duplicate marking(s)", applied)
-    return newsletters
+    return _apply_dedup_assignments(newsletters, assignments, "Stage2")
 
 
 def make_anthropic_client(cfg: Config) -> Anthropic:
     """Create a single Anthropic client to be reused across multiple generate_digest calls."""
+    if not cfg.anthropic_api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is required for selected processing mode")
     return Anthropic(api_key=cfg.anthropic_api_key)
 
 
@@ -688,73 +732,125 @@ def generate_digest(
     date: str,
     emails: list[FetchedEmail],
     client: Anthropic | None = None,
+    processing_mode: ProcessingMode | None = None,
 ) -> Digest | None:
     if not emails:
         return None
 
-    if client is None:
-        client = Anthropic(api_key=cfg.anthropic_api_key)
+    mode: ProcessingMode = processing_mode or cfg.processing_mode
+    if mode in ("llm-only", "hybrid") and client is None:
+        client = make_anthropic_client(cfg)
     debug_dir = cfg.data_dir / "digests" / "raw"
 
-    # Stage 1: extract topics per newsletter in parallel
+    # Stage 1: extract topics
     t_start = time.monotonic()
-    log.info(
-        "Stage1 start: %d newsletters, model=%s, max_workers=%d",
-        len(emails), cfg.anthropic_model_stage1, cfg.stage1_max_workers,
-    )
+    assembled: list[DigestNewsletter] = []
 
-    newsletters: list[DigestNewsletter | None] = [None] * len(emails)
-    max_workers = min(len(emails), cfg.stage1_max_workers)
+    if mode == "no-llm":
+        log.info("Stage1 start (rule-only): %d newsletters", len(emails))
+        assembled = [_rule_newsletter_from_email(idx, email) for idx, email in enumerate(emails)]
+    elif mode == "llm-only":
+        assert client is not None
+        log.info(
+            "Stage1 start (llm-only): %d newsletters, model=%s, max_workers=%d",
+            len(emails), cfg.anthropic_model_stage1, cfg.stage1_max_workers,
+        )
+        newsletters_llm: list[DigestNewsletter | None] = [None] * len(emails)
+        max_workers = min(len(emails), cfg.stage1_max_workers)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_extract_single_newsletter, client, cfg, idx, email, debug_dir): idx
-            for idx, email in enumerate(emails)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                nl = future.result()
-            except Exception:
-                log.exception(
-                    "Stage1 extraction failed for idx=%d sender=%r — inserting empty placeholder",
-                    idx, emails[idx].sender_name,
-                )
-                nl = DigestNewsletter(
-                    sender=emails[idx].sender_name or emails[idx].sender_email,
-                    subject=emails[idx].subject,
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_extract_single_newsletter, client, cfg, idx, email, debug_dir): idx
+                for idx, email in enumerate(emails)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    nl = future.result()
+                    nl.processed_with = "llm"
+                except Exception:
+                    log.exception(
+                        "Stage1 extraction failed for idx=%d sender=%r — inserting empty placeholder",
+                        idx, emails[idx].sender_name,
+                    )
+                    nl = DigestNewsletter(
+                        sender=emails[idx].sender_name or emails[idx].sender_email,
+                        subject=emails[idx].subject,
+                        topics=[],
+                        original_index=idx,
+                        processed_with="llm",
+                    )
+                newsletters_llm[idx] = nl
+
+        for i, nl in enumerate(newsletters_llm):
+            if nl is None:
+                log.error("Stage1: newsletter slot %d is still None — inserting empty placeholder", i)
+                newsletters_llm[i] = DigestNewsletter(
+                    sender=emails[i].sender_name or emails[i].sender_email,
+                    subject=emails[i].subject,
                     topics=[],
-                    original_index=idx,
+                    original_index=i,
+                    processed_with="llm",
                 )
-            newsletters[idx] = nl
-
-    # Safety: fill any None slots (should not happen, but guards against bugs)
-    for i, nl in enumerate(newsletters):
-        if nl is None:
-            log.error("Stage1: newsletter slot %d is still None — inserting empty placeholder", i)
-            newsletters[i] = DigestNewsletter(
-                sender=emails[i].sender_name or emails[i].sender_email,
-                subject=emails[i].subject,
-                topics=[],
-                original_index=i,
+        assembled = newsletters_llm  # type: ignore[assignment]
+    else:
+        assert client is not None
+        log.info(
+            "Stage1 start (hybrid): %d newsletters, llm_model=%s, max_workers=%d",
+            len(emails), cfg.anthropic_model_stage1, cfg.stage1_max_workers,
+        )
+        hybrid_newsletters: list[DigestNewsletter] = [
+            _rule_newsletter_from_email(idx, email) for idx, email in enumerate(emails)
+        ]
+        fallback_indices = [
+            idx
+            for idx, nl in enumerate(hybrid_newsletters)
+            if not rule_output_is_sufficient(
+                [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics]
             )
+        ]
+        log.info("Stage1 hybrid: %d/%d newsletters require LLM fallback", len(fallback_indices), len(emails))
+        if fallback_indices:
+            max_workers = min(len(fallback_indices), cfg.stage1_max_workers)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _extract_single_newsletter, client, cfg, idx, emails[idx], debug_dir
+                    ): idx
+                    for idx in fallback_indices
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        llm_nl = future.result()
+                        llm_nl.processed_with = "llm"
+                        hybrid_newsletters[idx] = llm_nl
+                    except Exception:
+                        log.exception(
+                            "Stage1 hybrid fallback failed for idx=%d sender=%r — keeping rule output",
+                            idx, emails[idx].sender_name,
+                        )
+        assembled = hybrid_newsletters
 
-    assembled: list[DigestNewsletter] = newsletters  # type: ignore[assignment]
     t_stage1 = time.monotonic()
     log.info(
-        "Stage1 complete: elapsed=%.1fs newsletters=%d total_topics=%d",
-        t_stage1 - t_start, len(assembled), sum(len(n.topics) for n in assembled),
+        "Stage1 complete: mode=%s elapsed=%.1fs newsletters=%d total_topics=%d",
+        mode, t_stage1 - t_start, len(assembled), sum(len(n.topics) for n in assembled),
     )
 
     # Stage 2: cross-newsletter deduplication
-    assembled = _run_stage2_dedup(client, cfg, assembled, date, debug_dir)
+    if mode == "llm-only":
+        assert client is not None
+        assembled = _run_stage2_dedup(client, cfg, assembled, date, debug_dir)
+    else:
+        assembled = _run_rule_dedup(assembled, date)
     t_stage2 = time.monotonic()
     log.info(
-        "Stage2 complete: elapsed=%.1fs",
-        t_stage2 - t_stage1,
+        "Stage2 complete: mode=%s elapsed=%.1fs",
+        mode, t_stage2 - t_stage1,
     )
 
-    digest = Digest(date=date, newsletters=assembled)
+    digest = Digest(date=date, newsletters=assembled, processing_mode=mode)
     log.info(
         "Digest assembled: newsletters=%d topics=%d duplicates=%d empty_newsletters=%d est_cost_usd=%.6f "
         "stage1=%.1fs stage2=%.1fs total=%.1fs",
@@ -773,6 +869,7 @@ def generate_digest(
 def digest_to_json(digest: Digest) -> str:
     payload = {
         "date": digest.date,
+        "processing_mode": digest.processing_mode,
         "newsletters": [
             {
                 "original_index": n.original_index,
@@ -781,6 +878,7 @@ def digest_to_json(digest: Digest) -> str:
                 "estimated_cost_usd": n.estimated_cost_usd,
                 "stage1_input_tokens": n.stage1_input_tokens,
                 "stage1_output_tokens": n.stage1_output_tokens,
+                "processed_with": n.processed_with,
                 "topics": [
                     {
                         "title": t.title,

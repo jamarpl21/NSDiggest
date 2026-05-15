@@ -1,20 +1,42 @@
 # NSDiggest
 
 Daily Gmail newsletter digest generator.  
-It fetches emails, summarizes them in Polish with Claude, deduplicates overlapping topics, and sends a styled HTML digest.
+It fetches emails, creates one combined digest email, deduplicates overlapping topics, and sends a styled HTML digest. Processing can run without LLM, with LLM only, or in hybrid mode.
 
 ## Pipeline
 
 ```text
-IMAP fetch -> Stage 1 (parallel per newsletter) -> Stage 2 (daily dedupe) -> Render HTML -> SMTP send -> Mark SEEN
+IMAP fetch -> Stage 1 (rule engine and/or LLM extraction) -> Stage 2 (rule or LLM dedupe) -> Render HTML -> SMTP send -> Mark SEEN
 ```
 
 1. **IMAP fetch**: load `UNSEEN` + recent messages, dedupe by Message-ID.
-2. **Stage 1**: one LLM call per newsletter (`ANTHROPIC_MODEL_STAGE1`) to extract topics.
-3. **Stage 2**: one lightweight LLM call (`ANTHROPIC_MODEL_STAGE2`) on compact Stage 1 output to mark duplicates.
+2. **Stage 1**: extract topics with selected processing mode:
+   - `no-llm`: rule-based extraction only
+   - `llm-only`: one LLM call per newsletter (`ANTHROPIC_MODEL_STAGE1`)
+   - `hybrid`: rule-based extraction first, LLM only for low-quality rule output
+3. **Stage 2**: dedupe via:
+   - `llm-only`: LLM dedupe (`ANTHROPIC_MODEL_STAGE2`)
+   - `no-llm` and `hybrid`: rule-based dedupe
 4. **Render**: build HTML email digest.
 5. **Send**: SMTP delivery.
 6. **Mark SEEN**: only after successful send.
+
+## Rule engine (`no-llm`) notes
+
+`no-llm` mode is optimized for newsletter-like formats (sections + numbered items).  
+Current extraction strategy in `src/rule_digest.py`:
+
+- strips common newsletter footer/boilerplate (`unsubscribe`, sign-off blocks)
+- parses markdown-like sections (`## ...`) and numbered items (`1. ...`)
+- builds one topic per numbered item, with section-aware titles
+- extracts links from the same item first (`[text](url)`), then falls back to deterministic raw-link matching
+- filters noise links (`audio`, `kliknij tutaj`, unsubscribe-style URLs)
+
+Practical implications:
+
+- quality is usually lower than `llm-only`, but much better than naive block splitting
+- link assignment is now stable and each topic should have at least one relevant link in typical list-based newsletters
+- for newsletters without clear list structure, the engine falls back to paragraph heuristics
 
 ## Project structure
 
@@ -45,6 +67,12 @@ cp .env.example .env
 # no send / no mark seen
 python -m src.main --dry-run
 
+# no-llm processing, no API usage
+python -m src.main --processing-mode no-llm --skip-send --skip-mark-seen
+
+# hybrid processing (LLM only when needed)
+python -m src.main --processing-mode hybrid --skip-send --skip-mark-seen
+
 # focused low-cost test
 python -m src.main --skip-send --skip-mark-seen --only-indices 0,3 --max-newsletters 2
 ```
@@ -59,7 +87,8 @@ Use `.env` (local) or `/etc/nsdiggest/nsdiggest.env` (server).
 | `GMAIL_APP_PASSWORD` | — | Gmail app password |
 | `DIGEST_TO` | — | Recipient email |
 | `DIGEST_FROM_NAME` | `Newsletter Digest` | Display name for sender |
-| `ANTHROPIC_API_KEY` | — | Claude API key |
+| `ANTHROPIC_API_KEY` | — | Claude API key (required for `llm-only` and `hybrid`) |
+| `PROCESSING_MODE` | `llm-only` | `no-llm`, `llm-only`, or `hybrid` |
 | `ANTHROPIC_MODEL_STAGE1` | `claude-sonnet-4-6` | Stage 1 model |
 | `ANTHROPIC_MODEL_STAGE2` | `claude-sonnet-4-6` | Stage 2 model |
 | `STAGE1_MAX_WORKERS` | `5` | Max parallel Stage 1 calls |
