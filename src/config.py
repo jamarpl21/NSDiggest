@@ -8,6 +8,7 @@ from typing import Literal
 from dotenv import load_dotenv
 
 ProcessingMode = Literal["no-llm", "llm-only", "hybrid"]
+EmailTransport = Literal["smtp", "gmail-api"]
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class Config:
 
     digest_to: str
     digest_from_name: str
+    email_transport: EmailTransport
 
     anthropic_api_key: str | None
     processing_mode: ProcessingMode
@@ -45,6 +47,11 @@ class Config:
     data_dir: Path
     log_level: str
     dry_run: bool
+
+    # Gmail API (HTTPS) sending mode; used when EMAIL_TRANSPORT=gmail-api
+    gmail_api_client_id: str | None
+    gmail_api_client_secret: str | None
+    gmail_api_refresh_token: str | None
 
 
 def _require(name: str) -> str:
@@ -73,9 +80,32 @@ def load_config() -> Config:
             "Invalid PROCESSING_MODE. Expected one of: no-llm, llm-only, hybrid"
         )
     processing_mode: ProcessingMode = processing_mode_raw  # type: ignore[assignment]
+    email_transport_raw = os.environ.get("EMAIL_TRANSPORT", "smtp").strip().lower()
+    allowed_transports = {"smtp", "gmail-api"}
+    if email_transport_raw not in allowed_transports:
+        raise RuntimeError("Invalid EMAIL_TRANSPORT. Expected one of: smtp, gmail-api")
+    email_transport: EmailTransport = email_transport_raw  # type: ignore[assignment]
     anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip() or None
     if processing_mode != "no-llm" and not anthropic_api_key:
         raise RuntimeError("Missing required env var: ANTHROPIC_API_KEY")
+
+    gmail_api_client_id = os.environ.get("GMAIL_API_CLIENT_ID", "").strip() or None
+    gmail_api_client_secret = os.environ.get("GMAIL_API_CLIENT_SECRET", "").strip() or None
+    gmail_api_refresh_token = os.environ.get("GMAIL_API_REFRESH_TOKEN", "").strip() or None
+    if email_transport == "gmail-api":
+        missing = [
+            name
+            for name, value in (
+                ("GMAIL_API_CLIENT_ID", gmail_api_client_id),
+                ("GMAIL_API_CLIENT_SECRET", gmail_api_client_secret),
+                ("GMAIL_API_REFRESH_TOKEN", gmail_api_refresh_token),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Missing required env var(s) for EMAIL_TRANSPORT=gmail-api: {', '.join(missing)}"
+            )
 
     return Config(
         gmail_user=_require("GMAIL_USER"),
@@ -86,6 +116,7 @@ def load_config() -> Config:
         smtp_port=int(os.environ.get("SMTP_PORT", "587")),
         digest_to=_require("DIGEST_TO"),
         digest_from_name=os.environ.get("DIGEST_FROM_NAME", "Newsletter Digest"),
+        email_transport=email_transport,
         anthropic_api_key=anthropic_api_key,
         processing_mode=processing_mode,
         anthropic_model_stage1=os.environ.get("ANTHROPIC_MODEL_STAGE1", legacy_model),
@@ -103,4 +134,7 @@ def load_config() -> Config:
         data_dir=data_dir,
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         dry_run=os.environ.get("DRY_RUN", "0") in ("1", "true", "True", "yes"),
+        gmail_api_client_id=gmail_api_client_id,
+        gmail_api_client_secret=gmail_api_client_secret,
+        gmail_api_refresh_token=gmail_api_refresh_token,
     )

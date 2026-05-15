@@ -6,7 +6,7 @@ It fetches emails, creates one combined digest email, deduplicates overlapping t
 ## Pipeline
 
 ```text
-IMAP fetch -> Stage 1 (rule engine and/or LLM extraction) -> Stage 2 (rule or LLM dedupe) -> Render HTML -> SMTP send -> Mark SEEN
+IMAP fetch -> Stage 1 (rule engine and/or LLM extraction) -> Stage 2 (rule or LLM dedupe) -> Render HTML -> Send (SMTP or Gmail API) -> Mark SEEN
 ```
 
 1. **IMAP fetch**: load `UNSEEN` + recent messages, dedupe by Message-ID.
@@ -18,7 +18,7 @@ IMAP fetch -> Stage 1 (rule engine and/or LLM extraction) -> Stage 2 (rule or LL
    - `llm-only`: LLM dedupe (`ANTHROPIC_MODEL_STAGE2`)
    - `no-llm` and `hybrid`: rule-based dedupe
 4. **Render**: build HTML email digest.
-5. **Send**: SMTP delivery.
+5. **Send**: delivery via selected transport (`EMAIL_TRANSPORT=smtp` or `gmail-api`).
 6. **Mark SEEN**: only after successful send.
 
 ## Rule engine (`no-llm`) notes
@@ -31,12 +31,16 @@ Current extraction strategy in `src/rule_digest.py`:
 - builds one topic per numbered item, with section-aware titles
 - extracts links from the same item first (`[text](url)`), then falls back to deterministic raw-link matching
 - filters noise links (`audio`, `kliknij tutaj`, unsubscribe-style URLs)
+- applies sender-specific rule profiles (e.g. different topic/link thresholds for Infopiguła, Puls Biznesu, EXANTE)
+- uses parser hierarchy (`BaseNewsletterParser` + sender-specific parsers) where structure is known to be problematic (`src/sender_parsers.py`)
+- in `hybrid`, can force LLM only for translation of long single-topic English newsletters from selected senders (currently e.g. EXANTE/Naval)
 
 Practical implications:
 
 - quality is usually lower than `llm-only`, but much better than naive block splitting
 - link assignment is now stable and each topic should have at least one relevant link in typical list-based newsletters
 - for newsletters without clear list structure, the engine falls back to paragraph heuristics
+- `hybrid` keeps per-sender quality history (`data/digests/sender_profiles.json`) and adapts whether to stay on rules or fallback to LLM
 
 ## Project structure
 
@@ -84,9 +88,13 @@ Use `.env` (local) or `/etc/nsdiggest/nsdiggest.env` (server).
 | Key | Default | Description |
 |---|---|---|
 | `GMAIL_USER` | — | Gmail account used as newsletter source |
-| `GMAIL_APP_PASSWORD` | — | Gmail app password |
+| `GMAIL_APP_PASSWORD` | — | Gmail app password (required for `EMAIL_TRANSPORT=smtp`) |
 | `DIGEST_TO` | — | Recipient email |
 | `DIGEST_FROM_NAME` | `Newsletter Digest` | Display name for sender |
+| `EMAIL_TRANSPORT` | `smtp` | Delivery transport: `smtp` or `gmail-api` |
+| `GMAIL_API_CLIENT_ID` | — | Google OAuth client id (required for `gmail-api`) |
+| `GMAIL_API_CLIENT_SECRET` | — | Google OAuth client secret (required for `gmail-api`) |
+| `GMAIL_API_REFRESH_TOKEN` | — | Google OAuth refresh token with Gmail send scope (required for `gmail-api`) |
 | `ANTHROPIC_API_KEY` | — | Claude API key (required for `llm-only` and `hybrid`) |
 | `PROCESSING_MODE` | `llm-only` | `no-llm`, `llm-only`, or `hybrid` |
 | `ANTHROPIC_MODEL_STAGE1` | `claude-sonnet-4-6` | Stage 1 model |
@@ -114,6 +122,21 @@ Pricing defaults above follow Anthropic Claude API pricing for Sonnet 4.6 at the
   - digest JSON (`estimated_cost_usd`, token counters)
   - rendered HTML (`cost LLM ~ $...`)
 - Cost is estimated from token usage returned by Anthropic API.
+
+## Metrics artifacts
+
+Each run now persists structured metrics to:
+
+- `data/runs/<run_id>.json` - full run snapshot
+- `data/runs/latest.json` - latest run pointer
+
+Run metrics include per-day and per-newsletter quality/cost signals:
+
+- topic counts, duplicates, empty newsletters
+- link coverage and missing-link topic counts
+- median summary length (words)
+- `processed_with` source (`rules` vs `llm`)
+- stage token counters and estimated LLM cost
 
 ## Public GitHub repository checklist
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
+import statistics
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+from .sender_parsers import ParserHelpers, select_parser
 
 BOILERPLATE_PATTERN = re.compile(
     r"(unsubscribe|manage preferences|view in browser|privacy policy|terms of service|stop receiving|"
@@ -52,6 +55,61 @@ class RuleTopic:
     title: str
     summary: str
     links: list[dict]
+
+
+@dataclass(frozen=True)
+class SenderRuleProfile:
+    max_topics: int
+    min_summary_words: int
+    min_link_coverage: float
+    min_topics_for_many_links: int
+
+
+DEFAULT_SENDER_PROFILE = SenderRuleProfile(
+    max_topics=24,
+    min_summary_words=12,
+    min_link_coverage=0.80,
+    min_topics_for_many_links=10,
+)
+
+SENDER_RULE_OVERRIDES: list[tuple[tuple[str, ...], SenderRuleProfile]] = [
+    (
+        ("infopiguła", "infopigula"),
+        SenderRuleProfile(max_topics=24, min_summary_words=12, min_link_coverage=0.90, min_topics_for_many_links=14),
+    ),
+    (
+        ("puls biznesu",),
+        SenderRuleProfile(max_topics=22, min_summary_words=12, min_link_coverage=0.88, min_topics_for_many_links=10),
+    ),
+    (
+        ("redakcja xyz", "xyz"),
+        SenderRuleProfile(max_topics=18, min_summary_words=11, min_link_coverage=0.80, min_topics_for_many_links=8),
+    ),
+    (
+        ("zero.pl", "zero"),
+        SenderRuleProfile(max_topics=16, min_summary_words=11, min_link_coverage=0.80, min_topics_for_many_links=7),
+    ),
+    (
+        ("exante",),
+        SenderRuleProfile(max_topics=12, min_summary_words=9, min_link_coverage=0.70, min_topics_for_many_links=5),
+    ),
+    (
+        ("wefunder",),
+        SenderRuleProfile(max_topics=14, min_summary_words=8, min_link_coverage=0.70, min_topics_for_many_links=5),
+    ),
+    (
+        ("infor",),
+        SenderRuleProfile(max_topics=14, min_summary_words=11, min_link_coverage=0.75, min_topics_for_many_links=6),
+    ),
+]
+
+
+def _resolve_sender_profile(sender_name: str = "", sender_email: str = "") -> SenderRuleProfile:
+    sender_key = f"{(sender_name or '').lower()} {(sender_email or '').lower()}"
+    for patterns, profile in SENDER_RULE_OVERRIDES:
+        if any(token in sender_key for token in patterns):
+            return profile
+    return DEFAULT_SENDER_PROFILE
 
 
 def _normalize_space(value: str) -> str:
@@ -131,6 +189,20 @@ def _extract_markdown_links(text: str) -> list[dict]:
         seen.add(url)
         links.append({"text": link_text[:120], "url": url})
     return links
+
+
+def _iter_markdown_links_with_spans(text: str) -> list[tuple[int, int, str, str]]:
+    out: list[tuple[int, int, str, str]] = []
+    seen: set[str] = set()
+    for match in MARKDOWN_LINK_RE.finditer(text):
+        text_a, url_a, text_b, url_b = match.groups()
+        link_text = (text_a or text_b or "Źródło").strip()
+        url = (url_a or url_b or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append((match.start(), match.end(), link_text, url))
+    return out
 
 
 def _is_noise_link(link_text: str, url: str) -> bool:
@@ -324,7 +396,11 @@ def _topic_from_item(section: str, item: str, raw_links: list[dict], used_urls: 
     return RuleTopic(title=title[:220], summary=summary, links=links)
 
 
-def extract_rule_topics(text_content: str, raw_links: list[dict], max_topics: int = 24) -> list[RuleTopic]:
+def _extract_rule_topics_generic(
+    text_content: str,
+    raw_links: list[dict],
+    max_topics: int,
+) -> list[RuleTopic]:
     text_content = _strip_newsletter_footer(text_content)
     blocks = _split_blocks(text_content)
     topics: list[RuleTopic] = []
@@ -382,7 +458,48 @@ def extract_rule_topics(text_content: str, raw_links: list[dict], max_topics: in
     return [fallback] if fallback is not None else []
 
 
-def rule_output_is_sufficient(topics: list[RuleTopic]) -> bool:
+def extract_rule_topics(
+    text_content: str,
+    raw_links: list[dict],
+    max_topics: int = 24,
+    sender_name: str = "",
+    sender_email: str = "",
+) -> list[RuleTopic]:
+    profile = _resolve_sender_profile(sender_name=sender_name, sender_email=sender_email)
+    if max_topics > 0:
+        profile = SenderRuleProfile(
+            max_topics=min(max_topics, profile.max_topics),
+            min_summary_words=profile.min_summary_words,
+            min_link_coverage=profile.min_link_coverage,
+            min_topics_for_many_links=profile.min_topics_for_many_links,
+        )
+    parser = select_parser(sender_name=sender_name, sender_email=sender_email)
+    helpers = ParserHelpers(
+        strip_newsletter_footer=_strip_newsletter_footer,
+        iter_markdown_links_with_spans=_iter_markdown_links_with_spans,
+        is_noise_link=_is_noise_link,
+        normalize_plain_text=_normalize_plain_text,
+        summary_from_block=_summary_from_block,
+        shorten_title=_shorten_title,
+        pick_links_for_block=_pick_links_for_block,
+        extract_rule_topics_generic=_extract_rule_topics_generic,
+        make_topic=lambda title, summary, links: RuleTopic(title=title, summary=summary, links=links),
+    )
+    return parser.parse(
+        text_content=text_content,
+        raw_links=raw_links,
+        profile=profile,
+        helpers=helpers,
+    )
+
+
+def rule_output_is_sufficient(
+    topics: list[RuleTopic],
+    raw_link_count: int = 0,
+    sender_name: str = "",
+    sender_email: str = "",
+) -> bool:
+    profile = _resolve_sender_profile(sender_name=sender_name, sender_email=sender_email)
     if not topics:
         return False
     summary_words = [len(t.summary.split()) for t in topics if t.summary.strip()]
@@ -391,6 +508,37 @@ def rule_output_is_sufficient(topics: list[RuleTopic]) -> bool:
     if max(summary_words) < 10:
         return False
     if all(not t.links for t in topics):
+        return False
+    linked_topics = sum(1 for t in topics if t.links)
+    missing_topics = len(topics) - linked_topics
+    missing_ratio = missing_topics / max(len(topics), 1)
+    median_summary_words = statistics.median(summary_words)
+    title_word_counts = [len((t.title or "").split()) for t in topics]
+    natural_title_ratio = (
+        sum(1 for c in title_word_counts if 3 <= c <= 16) / max(len(title_word_counts), 1)
+    )
+
+    # High amount of link-less topics usually means bad rule/link mapping.
+    if len(topics) >= 4 and missing_ratio > 0.20:
+        return False
+    # Very short summaries on many topics indicate low information density.
+    if len(topics) >= 8 and median_summary_words < profile.min_summary_words:
+        return False
+    # Keep titles reasonably headline-like.
+    if natural_title_ratio < 0.70:
+        return False
+    # If topic count greatly exceeds source links, this is often over-segmentation.
+    if raw_link_count > 0 and len(topics) > max(24, int(raw_link_count * 0.95) + 2):
+        return False
+    # If source has many links but only a few extracted topics, this is usually under-segmentation.
+    if raw_link_count >= 20:
+        if len(topics) < profile.min_topics_for_many_links:
+            return False
+        if len(topics) / raw_link_count < 0.33:
+            return False
+    elif raw_link_count >= 12 and len(topics) < 6:
+        return False
+    if linked_topics / max(len(topics), 1) < profile.min_link_coverage:
         return False
     return True
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -22,6 +23,14 @@ log = logging.getLogger(__name__)
 
 STAGE1_MAX_OUTPUT_TOKENS = 8192
 STAGE2_MAX_OUTPUT_TOKENS = 4096
+TOKEN_RE = re.compile(r"[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}")
+SENDER_PROFILE_FILE = "sender_profiles.json"
+TRANSLATION_SENDER_HINTS = ("exante", "naval")
+ENGLISH_HINT_WORDS = {
+    "the", "and", "with", "from", "into", "this", "that", "will", "market", "markets",
+    "global", "policy", "growth", "inflation", "investors", "earnings", "outlook", "update",
+    "weekly", "daily", "insights", "economy", "rates", "stocks", "bonds",
+}
 
 
 def _sanitize_json_control_chars(raw: str) -> str:
@@ -590,8 +599,61 @@ def _build_stage2_message(newsletters: list[DigestNewsletter]) -> str:
     )
 
 
+def _sender_key(email: FetchedEmail) -> str:
+    sender_email = (email.sender_email or "").strip().lower()
+    sender_name = (email.sender_name or "").strip().lower()
+    return sender_email or sender_name or "unknown-sender"
+
+
+def _load_sender_profiles(cfg: Config) -> dict[str, dict]:
+    path = cfg.data_dir / "digests" / SENDER_PROFILE_FILE
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.warning("Sender profile file is malformed: %s", path)
+        return {}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _save_sender_profiles(cfg: Config, profiles: dict[str, dict]) -> None:
+    path = cfg.data_dir / "digests" / SENDER_PROFILE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _should_trust_rules_for_sender(profile: dict) -> bool:
+    good = int(profile.get("rule_good_runs", 0) or 0)
+    bad = int(profile.get("rule_bad_runs", 0) or 0)
+    total = good + bad
+    if total < 3:
+        return False
+    bad_ratio = bad / total if total > 0 else 1.0
+    return good >= 3 and bad_ratio <= 0.20
+
+
+def _rule_is_acceptable_for_trusted_sender(topics: list[RuleTopic]) -> bool:
+    if not topics:
+        return False
+    linked = sum(1 for t in topics if t.links)
+    if linked / max(len(topics), 1) < 0.60:
+        return False
+    summary_words = [len((t.summary or "").split()) for t in topics]
+    if not summary_words:
+        return False
+    return max(summary_words) >= 8
+
+
 def _rule_newsletter_from_email(idx: int, email: FetchedEmail) -> DigestNewsletter:
-    rule_topics = extract_rule_topics(email.text_content, email.raw_links)
+    rule_topics = extract_rule_topics(
+        email.text_content,
+        email.raw_links,
+        sender_name=email.sender_name,
+        sender_email=email.sender_email,
+    )
     topics = [DigestTopic(title=t.title, summary=t.summary, links=t.links) for t in rule_topics]
     return DigestNewsletter(
         sender=email.sender_name or email.sender_email,
@@ -603,6 +665,64 @@ def _rule_newsletter_from_email(idx: int, email: FetchedEmail) -> DigestNewslett
         stage1_output_tokens=0,
         processed_with="rules",
     )
+
+
+def _english_text_density(text: str) -> float:
+    tokens = re.findall(r"[a-z]{2,}", (text or "").lower())
+    if not tokens:
+        return 0.0
+    english_hits = sum(1 for token in tokens if token in ENGLISH_HINT_WORDS)
+    return english_hits / len(tokens)
+
+
+def _should_route_for_translation(email: FetchedEmail, newsletter: DigestNewsletter) -> bool:
+    """Route to LLM only for long single-topic English newsletters (e.g., EXANTE/Naval)."""
+    sender_blob = f"{email.sender_name} {email.sender_email} {email.subject}".lower()
+    if not any(hint in sender_blob for hint in TRANSLATION_SENDER_HINTS):
+        return False
+    topic_count = len(newsletter.topics)
+    if topic_count < 1 or topic_count > 3:
+        return False
+    if len(email.text_content or "") < 3500:
+        return False
+    sample = " ".join(
+        [email.subject] + [f"{topic.title} {topic.summary}" for topic in newsletter.topics]
+    )
+    sample = f"{sample}\n{(email.text_content or '')[:3000]}"
+    return _english_text_density(sample) >= 0.06
+
+
+def _tokenize_for_link_backfill(text: str) -> set[str]:
+    return {w.lower() for w in TOKEN_RE.findall(text or "")}
+
+
+def _backfill_missing_topic_links(newsletter: DigestNewsletter, email: FetchedEmail) -> None:
+    used_urls = {
+        lk.get("url", "")
+        for topic in newsletter.topics
+        for lk in topic.links
+        if isinstance(lk, dict) and lk.get("url")
+    }
+    for topic in newsletter.topics:
+        if topic.links:
+            continue
+        topic_tokens = _tokenize_for_link_backfill(topic.title + " " + topic.summary)
+        best_link: dict | None = None
+        best_score = -1
+        for idx, lk in enumerate(email.raw_links):
+            url = (lk.get("url") or "").strip()
+            text = (lk.get("text") or "").strip()
+            if not url or url in used_urls:
+                continue
+            link_tokens = _tokenize_for_link_backfill(text)
+            overlap = len(topic_tokens & link_tokens)
+            score = overlap * 10 + max(0, 5 - idx)
+            if score > best_score:
+                best_score = score
+                best_link = {"text": text[:120] or "Źródło", "url": url}
+        if best_link is not None:
+            topic.links = [best_link]
+            used_urls.add(best_link["url"])
 
 
 def _apply_dedup_assignments(newsletters: list[DigestNewsletter], assignments: list[dict], source: str) -> list[DigestNewsletter]:
@@ -741,6 +861,7 @@ def generate_digest(
     if mode in ("llm-only", "hybrid") and client is None:
         client = make_anthropic_client(cfg)
     debug_dir = cfg.data_dir / "digests" / "raw"
+    sender_profiles = _load_sender_profiles(cfg)
 
     # Stage 1: extract topics
     t_start = time.monotonic()
@@ -802,14 +923,42 @@ def generate_digest(
         hybrid_newsletters: list[DigestNewsletter] = [
             _rule_newsletter_from_email(idx, email) for idx, email in enumerate(emails)
         ]
-        fallback_indices = [
-            idx
-            for idx, nl in enumerate(hybrid_newsletters)
-            if not rule_output_is_sufficient(
-                [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics]
+        fallback_indices: list[int] = []
+        fallback_reason_by_idx: dict[int, str] = {}
+        for idx, nl in enumerate(hybrid_newsletters):
+            email = emails[idx]
+            sender_key = _sender_key(email)
+            profile = sender_profiles.get(sender_key, {})
+            rule_topics = [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics]
+            base_sufficient = rule_output_is_sufficient(
+                rule_topics,
+                raw_link_count=len(email.raw_links),
+                sender_name=email.sender_name,
+                sender_email=email.sender_email,
             )
-        ]
-        log.info("Stage1 hybrid: %d/%d newsletters require LLM fallback", len(fallback_indices), len(emails))
+            if _should_trust_rules_for_sender(profile):
+                if not _rule_is_acceptable_for_trusted_sender(rule_topics):
+                    fallback_indices.append(idx)
+                    fallback_reason_by_idx[idx] = "trusted-quality-guard"
+            elif not base_sufficient:
+                fallback_indices.append(idx)
+                fallback_reason_by_idx[idx] = "quality-threshold"
+            elif _should_route_for_translation(email, nl):
+                fallback_indices.append(idx)
+                fallback_reason_by_idx[idx] = "translation-single-topic"
+        if fallback_indices:
+            fallback_senders = [
+                f"{emails[idx].sender_name}:{fallback_reason_by_idx.get(idx, 'unknown')}"
+                for idx in fallback_indices
+            ]
+            log.info(
+                "Stage1 hybrid: %d/%d newsletters require LLM fallback senders=%s",
+                len(fallback_indices),
+                len(emails),
+                fallback_senders,
+            )
+        else:
+            log.info("Stage1 hybrid: 0/%d newsletters require LLM fallback", len(emails))
         if fallback_indices:
             max_workers = min(len(fallback_indices), cfg.stage1_max_workers)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -824,7 +973,27 @@ def generate_digest(
                     try:
                         llm_nl = future.result()
                         llm_nl.processed_with = "llm"
-                        hybrid_newsletters[idx] = llm_nl
+                        rule_nl = hybrid_newsletters[idx]
+                        llm_linked_topics = sum(1 for t in llm_nl.topics if t.links)
+                        rule_linked_topics = sum(1 for t in rule_nl.topics if t.links)
+                        llm_too_weak = (
+                            (not llm_nl.topics and bool(rule_nl.topics))
+                            or (llm_linked_topics == 0 and rule_linked_topics > 0)
+                            or (
+                                len(rule_nl.topics) >= 6
+                                and len(llm_nl.topics) < max(1, len(rule_nl.topics) // 3)
+                            )
+                        )
+                        if llm_too_weak:
+                            log.warning(
+                                "Stage1 hybrid fallback weak for idx=%d sender=%r (rule_topics=%d llm_topics=%d) — keeping rule output",
+                                idx,
+                                emails[idx].sender_name,
+                                len(rule_nl.topics),
+                                len(llm_nl.topics),
+                            )
+                        else:
+                            hybrid_newsletters[idx] = llm_nl
                     except Exception:
                         log.exception(
                             "Stage1 hybrid fallback failed for idx=%d sender=%r — keeping rule output",
@@ -833,13 +1002,46 @@ def generate_digest(
         assembled = hybrid_newsletters
 
     t_stage1 = time.monotonic()
+    for idx, nl in enumerate(assembled):
+        _backfill_missing_topic_links(nl, emails[idx])
+        sender_key = _sender_key(emails[idx])
+        profile = sender_profiles.setdefault(
+            sender_key,
+            {
+                "sender_name": emails[idx].sender_name or emails[idx].sender_email,
+                "rule_good_runs": 0,
+                "rule_bad_runs": 0,
+                "llm_runs": 0,
+                "last_mode": "",
+                "last_processed_with": "",
+            },
+        )
+        if nl.processed_with == "llm":
+            profile["llm_runs"] = int(profile.get("llm_runs", 0) or 0) + 1
+            profile["rule_bad_runs"] = int(profile.get("rule_bad_runs", 0) or 0) + 1
+        else:
+            quality_ok = rule_output_is_sufficient(
+                [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics],
+                raw_link_count=len(emails[idx].raw_links),
+                sender_name=emails[idx].sender_name,
+                sender_email=emails[idx].sender_email,
+            )
+            if quality_ok:
+                profile["rule_good_runs"] = int(profile.get("rule_good_runs", 0) or 0) + 1
+            else:
+                profile["rule_bad_runs"] = int(profile.get("rule_bad_runs", 0) or 0) + 1
+        profile["last_mode"] = mode
+        profile["last_processed_with"] = nl.processed_with
+
+    _save_sender_profiles(cfg, sender_profiles)
+
     log.info(
         "Stage1 complete: mode=%s elapsed=%.1fs newsletters=%d total_topics=%d",
         mode, t_stage1 - t_start, len(assembled), sum(len(n.topics) for n in assembled),
     )
 
     # Stage 2: cross-newsletter deduplication
-    if mode == "llm-only":
+    if mode in ("llm-only", "hybrid"):
         assert client is not None
         assembled = _run_stage2_dedup(client, cfg, assembled, date, debug_dir)
     else:
