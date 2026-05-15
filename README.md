@@ -57,6 +57,10 @@ deploy/
   install.sh
   nsdiggest.service
   nsdiggest.timer
+  release_deploy.sh
+  release_rollback.sh
+.github/workflows/
+  deploy-prod.yml
 .env.example
 requirements.txt
 ```
@@ -80,6 +84,80 @@ python -m src.main --processing-mode hybrid --skip-send --skip-mark-seen
 
 # focused low-cost test
 python -m src.main --skip-send --skip-mark-seen --only-indices 0,3 --max-newsletters 2
+```
+
+## Production deploy (GitHub + DigitalOcean, no Docker)
+
+Deploys are tag-based and run through GitHub Actions (`.github/workflows/deploy-prod.yml`).
+
+### 1. One-time server bootstrap
+
+On the droplet, run:
+
+```bash
+sudo bash deploy/install.sh
+```
+
+This creates:
+
+- `/opt/nsdiggest/releases/<release_id>`
+- `/opt/nsdiggest/current` (active symlink)
+- `/etc/nsdiggest/nsdiggest.env` (production env, outside git)
+- `nsdiggest.service` and `nsdiggest.timer`
+
+### 2. Configure GitHub secrets
+
+Create `production` environment in GitHub and set:
+
+- `PROD_SSH_HOST`
+- `PROD_SSH_USER`
+- `PROD_SSH_PORT`
+- `PROD_SSH_KEY` (private key for CI runner)
+- `PROD_KNOWN_HOSTS` (output from `ssh-keyscan`)
+
+Recommended: enable required reviewers for the `production` environment.
+
+### 3. Release flow
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+Pipeline behavior:
+
+1. Builds and validates Python artifact on GitHub Actions.
+2. Uploads `.tar.gz` to droplet over SSH.
+3. Runs `deploy/release_deploy.sh` remotely:
+   - extracts to `/opt/nsdiggest/releases/<tag>`
+   - creates release-local `.venv`
+   - installs/refreshes systemd units
+   - switches `/opt/nsdiggest/current` atomically
+   - runs smoke check (`--dry-run --skip-send --skip-mark-seen --max-newsletters 1`)
+   - keeps only the latest releases (`KEEP_RELEASES`, default `5`)
+
+### 4. Rollback
+
+Rollback to previous release:
+
+```bash
+sudo /opt/nsdiggest/current/deploy/release_rollback.sh
+```
+
+Rollback to an explicit release id:
+
+```bash
+sudo /opt/nsdiggest/current/deploy/release_rollback.sh v1.1.0
+```
+
+### 5. Operations cheatsheet
+
+```bash
+systemctl status nsdiggest.timer
+systemctl status nsdiggest.service
+journalctl -u nsdiggest.service -e
+tail -f /var/log/nsdiggest/run.log
+readlink -f /opt/nsdiggest/current
 ```
 
 ## Configuration
