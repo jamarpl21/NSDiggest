@@ -12,6 +12,7 @@ from anthropic import Anthropic
 
 from .config import Config, ProcessingMode
 from .fetch import FetchedEmail
+from .readability import evaluate_human_readability
 from .rule_digest import (
     RuleTopic,
     compute_rule_dedup_assignments,
@@ -26,6 +27,7 @@ STAGE2_MAX_OUTPUT_TOKENS = 4096
 TOKEN_RE = re.compile(r"[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}")
 SENDER_PROFILE_FILE = "sender_profiles.json"
 TRANSLATION_SENDER_HINTS = ("exante", "naval")
+SEMANTIC_SEGMENTATION_SENDERS = ("redakcja xyz",)
 ENGLISH_HINT_WORDS = {
     "the", "and", "with", "from", "into", "this", "that", "will", "market", "markets",
     "global", "policy", "growth", "inflation", "investors", "earnings", "outlook", "update",
@@ -692,6 +694,13 @@ def _should_route_for_translation(email: FetchedEmail, newsletter: DigestNewslet
     return _english_text_density(sample) >= 0.06
 
 
+def _should_force_llm_for_semantic_segmentation(email: FetchedEmail) -> bool:
+    sender_blob = f"{email.sender_name} {email.sender_email}".lower()
+    if any(hint in sender_blob for hint in SEMANTIC_SEGMENTATION_SENDERS):
+        return True
+    return False
+
+
 def _tokenize_for_link_backfill(text: str) -> set[str]:
     return {w.lower() for w in TOKEN_RE.findall(text or "")}
 
@@ -930,6 +939,7 @@ def generate_digest(
             sender_key = _sender_key(email)
             profile = sender_profiles.get(sender_key, {})
             rule_topics = [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics]
+            readability = evaluate_human_readability(rule_topics)
             base_sufficient = rule_output_is_sufficient(
                 rule_topics,
                 raw_link_count=len(email.raw_links),
@@ -943,6 +953,12 @@ def generate_digest(
             elif not base_sufficient:
                 fallback_indices.append(idx)
                 fallback_reason_by_idx[idx] = "quality-threshold"
+            elif readability.score < 0.70 or readability.unreadable_topics > 0:
+                fallback_indices.append(idx)
+                fallback_reason_by_idx[idx] = "human-readability"
+            elif _should_force_llm_for_semantic_segmentation(email):
+                fallback_indices.append(idx)
+                fallback_reason_by_idx[idx] = "semantic-segmentation"
             elif _should_route_for_translation(email, nl):
                 fallback_indices.append(idx)
                 fallback_reason_by_idx[idx] = "translation-single-topic"

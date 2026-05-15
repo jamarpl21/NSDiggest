@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from .config import ProcessingMode, load_config
 from .digest import digest_to_json, generate_digest, make_anthropic_client
 from .fetch import FetchedEmail, fetch_newsletters, group_by_date, mark_seen
+from .readability import evaluate_human_readability
 from .render import render_email
 from .send import send_html_email
 
@@ -70,6 +71,7 @@ def _build_day_metrics(date: str, digest, day_emails: list[FetchedEmail], elapse
         duplicate_topics = sum(1 for t in nl.topics if t.duplicate_of is not None)
         summary_lengths = [len((t.summary or "").split()) for t in nl.topics if (t.summary or "").strip()]
         median_summary_words = statistics.median(summary_lengths) if summary_lengths else 0.0
+        readability = evaluate_human_readability(nl.topics)
         newsletter_metrics.append(
             {
                 "original_index": nl.original_index,
@@ -83,6 +85,8 @@ def _build_day_metrics(date: str, digest, day_emails: list[FetchedEmail], elapse
                 "link_coverage_ratio": (linked_topics / topic_count) if topic_count > 0 else 0.0,
                 "duplicate_topics": duplicate_topics,
                 "median_summary_words": median_summary_words,
+                "human_readability_score": readability.score,
+                "unreadable_topics": readability.unreadable_topics,
                 "raw_links_count": raw_links_count,
                 "estimated_cost_usd": nl.estimated_cost_usd,
                 "stage1_input_tokens": nl.stage1_input_tokens,
@@ -93,6 +97,10 @@ def _build_day_metrics(date: str, digest, day_emails: list[FetchedEmail], elapse
     total_topics = sum(n["topic_count"] for n in newsletter_metrics)
     total_linked_topics = sum(n["linked_topics"] for n in newsletter_metrics)
     total_missing_link_topics = sum(n["missing_link_topics"] for n in newsletter_metrics)
+    total_unreadable_topics = sum(n["unreadable_topics"] for n in newsletter_metrics)
+    weighted_readability = (
+        sum(n["human_readability_score"] * n["topic_count"] for n in newsletter_metrics) / max(total_topics, 1)
+    )
     return {
         "date": date,
         "processing_mode": digest.processing_mode,
@@ -104,6 +112,8 @@ def _build_day_metrics(date: str, digest, day_emails: list[FetchedEmail], elapse
         "estimated_cost_usd": digest.estimated_cost_usd,
         "link_coverage_ratio": (total_linked_topics / total_topics) if total_topics > 0 else 0.0,
         "missing_link_topics": total_missing_link_topics,
+        "human_readability_score": weighted_readability if total_topics > 0 else 0.0,
+        "unreadable_topics": total_unreadable_topics,
         "newsletters": newsletter_metrics,
     }
 

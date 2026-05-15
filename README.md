@@ -34,6 +34,7 @@ Current extraction strategy in `src/rule_digest.py`:
 - applies sender-specific rule profiles (e.g. different topic/link thresholds for Infopiguła, Puls Biznesu, EXANTE)
 - uses parser hierarchy (`BaseNewsletterParser` + sender-specific parsers) where structure is known to be problematic (`src/sender_parsers.py`)
 - in `hybrid`, can force LLM only for translation of long single-topic English newsletters from selected senders (currently e.g. EXANTE/Naval)
+- in `hybrid`, can force LLM when rule output is not human-readable enough (`human_readability_score`) or when sender needs semantic segmentation (e.g. XYZ)
 
 Practical implications:
 
@@ -135,6 +136,7 @@ Run metrics include per-day and per-newsletter quality/cost signals:
 - topic counts, duplicates, empty newsletters
 - link coverage and missing-link topic counts
 - median summary length (words)
+- human readability score and unreadable topic count (noise/tracking leak detector)
 - `processed_with` source (`rules` vs `llm`)
 - stage token counters and estimated LLM cost
 

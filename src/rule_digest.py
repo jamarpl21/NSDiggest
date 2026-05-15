@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import re
 import statistics
+from html import unescape
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
+from .readability import evaluate_human_readability
 from .sender_parsers import ParserHelpers, select_parser
 
 BOILERPLATE_PATTERN = re.compile(
@@ -15,6 +17,7 @@ BOILERPLATE_PATTERN = re.compile(
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 WORD_RE = re.compile(r"[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{2,}")
+TRACKING_TOKEN_RE = re.compile(r"(api-esp|smng\.|attrs=|order=|utm_|vib-cmp|mailing|redirect)", re.IGNORECASE)
 TRACKING_QUERY_PREFIXES = ("utm_", "mc_", "vero_", "mkt_")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,4}\s+(.+?)\s*$")
 NUMBERED_ITEM_RE = re.compile(r"^\s*\d+\.\s+(.*\S)\s*$")
@@ -79,7 +82,7 @@ SENDER_RULE_OVERRIDES: list[tuple[tuple[str, ...], SenderRuleProfile]] = [
     ),
     (
         ("puls biznesu",),
-        SenderRuleProfile(max_topics=22, min_summary_words=12, min_link_coverage=0.88, min_topics_for_many_links=10),
+        SenderRuleProfile(max_topics=22, min_summary_words=9, min_link_coverage=0.85, min_topics_for_many_links=8),
     ),
     (
         ("redakcja xyz", "xyz"),
@@ -121,9 +124,43 @@ def _tokenize(value: str) -> set[str]:
 
 
 def _normalize_plain_text(value: str) -> str:
-    return _normalize_space(
-        value.replace("**", "").replace("__", "").replace("_", "").replace("`", "")
+    raw = unescape(
+        (value or "")
+        .replace("\u00a0", " ")
+        .replace("\u200c", " ")
+        .replace("\ufeff", " ")
+        .replace("**", "")
+        .replace("__", "")
+        .replace("_", "")
+        .replace("`", "")
     )
+    raw = raw.replace("&lt;", " ").replace("&gt;", " ")
+    raw = raw.replace("](", " ").replace(")(", " ")
+    raw = re.sub(r"\[[^\]]*\]\([^)]*\)", " ", raw)
+    raw = re.sub(r"\[[^\]]*$", " ", raw)
+    raw = re.sub(r"\]\(<[^)]*$", " ", raw)
+    raw = re.sub(
+        MARKDOWN_LINK_RE,
+        lambda m: (m.group(1) or m.group(3) or "Źródło"),
+        raw,
+    )
+    raw = re.sub(r"https?://\S+", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"(?m)^\s*[-:]{2,}\s*$", " ", raw)
+    raw = re.sub(r"\|+", " ", raw)
+    raw = re.sub(r"\b\S*(?:attrs=|order=|api-esp|smng\.|vib-cmp)\S*\b", " ", raw, flags=re.IGNORECASE)
+    cleaned_tokens: list[str] = []
+    for token in raw.split():
+        low = token.lower()
+        has_digits = any(ch.isdigit() for ch in token)
+        has_letters = any(ch.isalpha() for ch in token)
+        if "](<" in token or token in {"[", "]", "<", ">", "(<", ">)"}:
+            continue
+        if TRACKING_TOKEN_RE.search(low):
+            continue
+        if len(token) >= 12 and has_digits and has_letters:
+            continue
+        cleaned_tokens.append(token)
+    return _normalize_space(" ".join(cleaned_tokens))
 
 
 def _shorten_title(value: str, max_words: int = 14) -> str:
@@ -255,6 +292,17 @@ def _extract_numbered_items(text: str) -> list[tuple[str, str]]:
 def _is_candidate_block(block: str) -> bool:
     if BOILERPLATE_PATTERN.search(block):
         return False
+    tokens = block.split()
+    if tokens:
+        noisy = 0
+        for token in tokens:
+            low = token.lower()
+            has_digits = any(ch.isdigit() for ch in token)
+            has_letters = any(ch.isalpha() for ch in token)
+            if TRACKING_TOKEN_RE.search(low) or (len(token) >= 12 and has_digits and has_letters):
+                noisy += 1
+        if noisy / len(tokens) > 0.18:
+            return False
     words = WORD_RE.findall(block)
     if len(words) < 8:
         return False
@@ -288,6 +336,32 @@ def _title_from_block(block: str) -> str:
 def _summary_from_block(block: str) -> str:
     clean = _normalize_plain_text(block)
     sentences = [s.strip() for s in SENTENCE_SPLIT_RE.split(clean) if s.strip()]
+    filtered: list[str] = []
+    for sentence in sentences:
+        sentence = re.sub(r"^[\s,;:\-\.\)\]]+", "", sentence).strip()
+        sentence = re.sub(r"\[[^\]]*$", "", sentence).strip()
+        low = sentence.lower()
+        if low.startswith(("zobacz w przeglądarce", "kliknij tutaj", "pobierz aplikację")):
+            continue
+        if "@" in sentence or "wydawca" in low:
+            continue
+        if "[](" in sentence or "---" in sentence or "](<" in sentence:
+            continue
+        tokens = sentence.split()
+        if len(tokens) < 6:
+            continue
+        noisy = 0
+        for token in tokens:
+            low_token = token.lower()
+            has_digits = any(ch.isdigit() for ch in token)
+            has_letters = any(ch.isalpha() for ch in token)
+            if TRACKING_TOKEN_RE.search(low_token) or (len(token) >= 12 and has_digits and has_letters):
+                noisy += 1
+        if noisy / max(len(tokens), 1) > 0.16:
+            continue
+        filtered.append(sentence)
+    if filtered:
+        sentences = filtered
     if not sentences:
         return clean[:280]
     selected = sentences[:3]
@@ -501,6 +575,11 @@ def rule_output_is_sufficient(
 ) -> bool:
     profile = _resolve_sender_profile(sender_name=sender_name, sender_email=sender_email)
     if not topics:
+        return False
+    readability = evaluate_human_readability(topics)
+    if readability.score < 0.62:
+        return False
+    if readability.unreadable_topics / max(readability.topics_count, 1) > 0.15:
         return False
     summary_words = [len(t.summary.split()) for t in topics if t.summary.strip()]
     if not summary_words:
