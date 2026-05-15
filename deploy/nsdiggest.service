@@ -1,0 +1,21 @@
+[Unit]
+Description=NSDiggest — daily newsletter digest run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nsdiggest
+Group=nsdiggest
+WorkingDirectory=/opt/nsdiggest
+EnvironmentFile=/etc/nsdiggest/nsdiggest.env
+ExecStart=/opt/nsdiggest/.venv/bin/python -m src.main
+StandardOutput=append:/var/log/nsdiggest/run.log
+StandardError=append:/var/log/nsdiggest/run.log
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/nsdiggest /var/log/nsdiggest
