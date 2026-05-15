@@ -68,8 +68,13 @@ sudo -u "${APP_USER}" bash -c "
   '${CURRENT_LINK}/.venv/bin/python' -m src.main --help >/dev/null
 "
 
-echo ">>> Ensuring timer is active"
-systemctl start nsdiggest.timer
+echo ">>> Timer status after deploy"
+if systemctl is-active --quiet nsdiggest.timer; then
+  echo "nsdiggest.timer is already active (no restart performed)."
+else
+  echo "nsdiggest.timer is inactive. Start manually when ready:"
+  echo "  sudo systemctl start nsdiggest.timer"
+fi
 
 echo ">>> Cleaning up old releases (keep ${KEEP_RELEASES})"
 mapfile -t release_paths < <(ls -1dt "${RELEASES_DIR}"/* 2>/dev/null || true)

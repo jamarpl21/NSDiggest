@@ -55,12 +55,19 @@ target_release_id="$(basename "${target_release_path}")"
 echo ">>> Rolling back to ${target_release_id}"
 ln -sfn "${target_release_path}" "${CURRENT_LINK}"
 
-echo ">>> Reloading systemd and ensuring timer is active"
+echo ">>> Reloading systemd units"
 install -o root -g root -m 0644 "${CURRENT_LINK}/deploy/nsdiggest.service" /etc/systemd/system/nsdiggest.service
 install -o root -g root -m 0644 "${CURRENT_LINK}/deploy/nsdiggest.timer" /etc/systemd/system/nsdiggest.timer
 systemctl daemon-reload
 systemctl enable nsdiggest.timer >/dev/null
-systemctl start nsdiggest.timer
+
+echo ">>> Timer status after rollback"
+if systemctl is-active --quiet nsdiggest.timer; then
+  echo "nsdiggest.timer is already active (no restart performed)."
+else
+  echo "nsdiggest.timer is inactive. Start manually when ready:"
+  echo "  sudo systemctl start nsdiggest.timer"
+fi
 
 echo ">>> Fast startup check after rollback (no inbox processing)"
 sudo -u "${APP_USER}" bash -c "

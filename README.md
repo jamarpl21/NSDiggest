@@ -134,6 +134,7 @@ Pipeline behavior:
    - installs/refreshes systemd units
    - switches `/opt/nsdiggest/current` atomically
    - runs fast startup check (`python -m src.main --help`) without processing inbox
+   - does not auto-start timer if it is stopped (manual start required)
    - keeps only the latest releases (`KEEP_RELEASES`, default `5`)
 
 ### 4. Rollback
