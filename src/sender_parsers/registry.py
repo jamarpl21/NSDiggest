@@ -11,7 +11,7 @@ def select_parser(sender_name: str = "", sender_email: str = "") -> BaseNewslett
     sender_key = f"{(sender_name or '').lower()} {(sender_email or '').lower()}"
     if "puls biznesu" in sender_key or "puls-biznesu" in sender_key:
         return PulsBiznesuParser()
-    if "redakcja xyz" in sender_key or " xyz" in sender_key:
+    if "redakcja xyz" in sender_key:
         return RedakcjaXYZParser()
     if "exante" in sender_key:
         return ExanteParser()

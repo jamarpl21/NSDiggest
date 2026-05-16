@@ -19,6 +19,7 @@ from .rule_digest import (
     extract_rule_topics,
     rule_output_is_sufficient,
 )
+from .sender_parsers import select_parser
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ STAGE2_MAX_OUTPUT_TOKENS = 4096
 TOKEN_RE = re.compile(r"[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}")
 SENDER_PROFILE_FILE = "sender_profiles.json"
 TRANSLATION_SENDER_HINTS = ("exante", "naval")
-SEMANTIC_SEGMENTATION_SENDERS = ("redakcja xyz",)
+XYZ_PARSER_NAME = "redakcja-xyz"
 ENGLISH_HINT_WORDS = {
     "the", "and", "with", "from", "into", "this", "that", "will", "market", "markets",
     "global", "policy", "growth", "inflation", "investors", "earnings", "outlook", "update",
@@ -627,6 +628,31 @@ def _save_sender_profiles(cfg: Config, profiles: dict[str, dict]) -> None:
     path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _prime_sender_profiles_for_emails(cfg: Config, emails: list[FetchedEmail], profiles: dict[str, dict]) -> None:
+    changed = False
+    for email in emails:
+        sender_key = _sender_key(email)
+        desired_sender_name = (email.sender_name or email.sender_email or "").strip()
+        existing = profiles.get(sender_key)
+        if not isinstance(existing, dict):
+            profiles[sender_key] = {
+                "sender_name": desired_sender_name,
+                "rule_good_runs": 0,
+                "rule_bad_runs": 0,
+                "llm_runs": 0,
+                "last_mode": "",
+                "last_processed_with": "",
+            }
+            changed = True
+            continue
+        current_sender_name = str(existing.get("sender_name", "") or "").strip()
+        if desired_sender_name and current_sender_name != desired_sender_name:
+            existing["sender_name"] = desired_sender_name
+            changed = True
+    if changed:
+        _save_sender_profiles(cfg, profiles)
+
+
 def _should_trust_rules_for_sender(profile: dict) -> bool:
     good = int(profile.get("rule_good_runs", 0) or 0)
     bad = int(profile.get("rule_bad_runs", 0) or 0)
@@ -649,16 +675,21 @@ def _rule_is_acceptable_for_trusted_sender(topics: list[RuleTopic]) -> bool:
     return max(summary_words) >= 8
 
 
-def _rule_newsletter_from_email(idx: int, email: FetchedEmail) -> DigestNewsletter:
+def _rule_newsletter_from_email(
+    idx: int,
+    email: FetchedEmail,
+    sender_name_override: str | None = None,
+) -> DigestNewsletter:
+    effective_sender_name = (sender_name_override or "").strip() or email.sender_name or email.sender_email
     rule_topics = extract_rule_topics(
         email.text_content,
         email.raw_links,
-        sender_name=email.sender_name,
+        sender_name=effective_sender_name,
         sender_email=email.sender_email,
     )
     topics = [DigestTopic(title=t.title, summary=t.summary, links=t.links) for t in rule_topics]
     return DigestNewsletter(
-        sender=email.sender_name or email.sender_email,
+        sender=effective_sender_name,
         subject=email.subject,
         topics=topics,
         original_index=idx,
@@ -694,11 +725,15 @@ def _should_route_for_translation(email: FetchedEmail, newsletter: DigestNewslet
     return _english_text_density(sample) >= 0.06
 
 
-def _should_force_llm_for_semantic_segmentation(email: FetchedEmail) -> bool:
-    sender_blob = f"{email.sender_name} {email.sender_email}".lower()
-    if any(hint in sender_blob for hint in SEMANTIC_SEGMENTATION_SENDERS):
-        return True
-    return False
+def _should_force_llm_for_semantic_segmentation(
+    email: FetchedEmail,
+    sender_name_override: str | None = None,
+) -> bool:
+    parser = select_parser(
+        sender_name=(sender_name_override or "").strip() or email.sender_name,
+        sender_email=email.sender_email,
+    )
+    return getattr(parser, "parser_name", "") == XYZ_PARSER_NAME
 
 
 def _tokenize_for_link_backfill(text: str) -> set[str]:
@@ -871,6 +906,16 @@ def generate_digest(
         client = make_anthropic_client(cfg)
     debug_dir = cfg.data_dir / "digests" / "raw"
     sender_profiles = _load_sender_profiles(cfg)
+    _prime_sender_profiles_for_emails(cfg, emails, sender_profiles)
+    sender_profile_by_idx: list[dict] = []
+    effective_sender_name_by_idx: list[str] = []
+    for email in emails:
+        sender_key = _sender_key(email)
+        profile = sender_profiles.get(sender_key, {})
+        profile = profile if isinstance(profile, dict) else {}
+        sender_profile_by_idx.append(profile)
+        profile_sender_name = str(profile.get("sender_name", "") or "").strip()
+        effective_sender_name_by_idx.append(profile_sender_name or email.sender_name or email.sender_email)
 
     # Stage 1: extract topics
     t_start = time.monotonic()
@@ -878,7 +923,10 @@ def generate_digest(
 
     if mode == "no-llm":
         log.info("Stage1 start (rule-only): %d newsletters", len(emails))
-        assembled = [_rule_newsletter_from_email(idx, email) for idx, email in enumerate(emails)]
+        assembled = [
+            _rule_newsletter_from_email(idx, email, sender_name_override=effective_sender_name_by_idx[idx])
+            for idx, email in enumerate(emails)
+        ]
     elif mode == "llm-only":
         assert client is not None
         log.info(
@@ -930,20 +978,25 @@ def generate_digest(
             len(emails), cfg.anthropic_model_stage1, cfg.stage1_max_workers,
         )
         hybrid_newsletters: list[DigestNewsletter] = [
-            _rule_newsletter_from_email(idx, email) for idx, email in enumerate(emails)
+            _rule_newsletter_from_email(idx, email, sender_name_override=effective_sender_name_by_idx[idx])
+            for idx, email in enumerate(emails)
         ]
         fallback_indices: list[int] = []
         fallback_reason_by_idx: dict[int, str] = {}
         for idx, nl in enumerate(hybrid_newsletters):
             email = emails[idx]
-            sender_key = _sender_key(email)
-            profile = sender_profiles.get(sender_key, {})
+            effective_sender_name = effective_sender_name_by_idx[idx]
+            if _should_force_llm_for_semantic_segmentation(email, sender_name_override=effective_sender_name):
+                fallback_indices.append(idx)
+                fallback_reason_by_idx[idx] = "semantic-segmentation"
+                continue
+            profile = sender_profile_by_idx[idx]
             rule_topics = [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics]
             readability = evaluate_human_readability(rule_topics)
             base_sufficient = rule_output_is_sufficient(
                 rule_topics,
                 raw_link_count=len(email.raw_links),
-                sender_name=email.sender_name,
+                sender_name=effective_sender_name,
                 sender_email=email.sender_email,
             )
             if _should_trust_rules_for_sender(profile):
@@ -956,15 +1009,12 @@ def generate_digest(
             elif readability.score < 0.70 or readability.unreadable_topics > 0:
                 fallback_indices.append(idx)
                 fallback_reason_by_idx[idx] = "human-readability"
-            elif _should_force_llm_for_semantic_segmentation(email):
-                fallback_indices.append(idx)
-                fallback_reason_by_idx[idx] = "semantic-segmentation"
             elif _should_route_for_translation(email, nl):
                 fallback_indices.append(idx)
                 fallback_reason_by_idx[idx] = "translation-single-topic"
         if fallback_indices:
             fallback_senders = [
-                f"{emails[idx].sender_name}:{fallback_reason_by_idx.get(idx, 'unknown')}"
+                f"{effective_sender_name_by_idx[idx]}:{fallback_reason_by_idx.get(idx, 'unknown')}"
                 for idx in fallback_indices
             ]
             log.info(
@@ -1000,7 +1050,8 @@ def generate_digest(
                                 and len(llm_nl.topics) < max(1, len(rule_nl.topics) // 3)
                             )
                         )
-                        if llm_too_weak:
+                        force_keep_llm = fallback_reason_by_idx.get(idx) == "semantic-segmentation"
+                        if llm_too_weak and not force_keep_llm:
                             log.warning(
                                 "Stage1 hybrid fallback weak for idx=%d sender=%r (rule_topics=%d llm_topics=%d) — keeping rule output",
                                 idx,
@@ -1024,7 +1075,7 @@ def generate_digest(
         profile = sender_profiles.setdefault(
             sender_key,
             {
-                "sender_name": emails[idx].sender_name or emails[idx].sender_email,
+                "sender_name": effective_sender_name_by_idx[idx],
                 "rule_good_runs": 0,
                 "rule_bad_runs": 0,
                 "llm_runs": 0,
@@ -1039,7 +1090,7 @@ def generate_digest(
             quality_ok = rule_output_is_sufficient(
                 [RuleTopic(title=t.title, summary=t.summary, links=t.links) for t in nl.topics],
                 raw_link_count=len(emails[idx].raw_links),
-                sender_name=emails[idx].sender_name,
+                sender_name=effective_sender_name_by_idx[idx],
                 sender_email=emails[idx].sender_email,
             )
             if quality_ok:

@@ -85,7 +85,7 @@ SENDER_RULE_OVERRIDES: list[tuple[tuple[str, ...], SenderRuleProfile]] = [
         SenderRuleProfile(max_topics=22, min_summary_words=9, min_link_coverage=0.85, min_topics_for_many_links=8),
     ),
     (
-        ("redakcja xyz", "xyz"),
+        ("redakcja xyz",),
         SenderRuleProfile(max_topics=18, min_summary_words=11, min_link_coverage=0.80, min_topics_for_many_links=8),
     ),
     (
