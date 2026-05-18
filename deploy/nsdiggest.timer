@@ -2,7 +2,7 @@
 Description=NSDiggest daily timer (07:00 Europe/Warsaw)
 
 [Timer]
-OnCalendar=*-*-* 07:00:00 Europe/Warsaw
+OnCalendar=*-*-* 08:30:00 Europe/Warsaw
 Persistent=true
 RandomizedDelaySec=5min
 Unit=nsdiggest.service
