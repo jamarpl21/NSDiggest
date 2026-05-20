@@ -1,8 +1,9 @@
 [Unit]
-Description=NSDiggest daily timer (07:00 Europe/Warsaw)
+Description=NSDiggest timer (disabled)
 
 [Timer]
-OnCalendar=*-*-* 08:30:00 Europe/Warsaw
+# Intentionally cleared to disable scheduled runs.
+OnCalendar=
 Persistent=true
 RandomizedDelaySec=5min
 Unit=nsdiggest.service
